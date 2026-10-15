@@ -76186,6 +76186,22 @@ bool ds4_session_has_vision_state(const ds4_session *s) {
     return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
 }
 
+size_t ds4_session_checkpoint_vision_spans(const ds4_session *s,
+                                           ds4_vision_span *out,
+                                           size_t cap) {
+    if (!s || !s->checkpoint_valid || (cap && !out)) return 0;
+    size_t n = s->checkpoint_image_count;
+    if (n > cap) n = cap;
+    for (size_t i = 0; i < n; i++) {
+        out[i].token_start = s->checkpoint_images[i].token_start;
+        out[i].embedding.token_count = s->checkpoint_images[i].token_count;
+        memcpy(out[i].embedding.fingerprint,
+               s->checkpoint_images[i].fingerprint,
+               sizeof(out[i].embedding.fingerprint));
+    }
+    return n;
+}
+
 static bool ds4_session_vision_range_overlaps(
         const ds4_session *s,
         uint32_t           token_start,

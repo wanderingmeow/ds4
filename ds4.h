@@ -470,6 +470,13 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+/* Copy the checkpoint's historical image spans (token_start + token_count +
+ * fingerprint) into out[0..cap).  Used to mask image token ranges while
+ * verifying a canonical-reuse prefix; never usable for inference.  Returns
+ * the number copied (<= cap). */
+size_t ds4_session_checkpoint_vision_spans(const ds4_session *s,
+                                           ds4_vision_span *out,
+                                           size_t cap);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,

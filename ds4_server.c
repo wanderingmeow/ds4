@@ -11581,6 +11581,7 @@ typedef enum {
     REUSE_MEMORY_TOKEN,
     REUSE_THINKING_VISIBLE,
     REUSE_MEMORY_TEXT,
+    REUSE_MEMORY_CANON, /* drift-tolerant canonical-history reuse */
 } slot_reuse_kind;
 
 typedef struct {
@@ -11589,6 +11590,226 @@ typedef struct {
     size_t suffix_off;  /* text tiers: byte offset of the new suffix text */
     int matched_ids;    /* tool-output tiers: number of bound call ids */
 } slot_reuse;
+
+/* ---------------------------------------------------------------------
+ * Drift-tolerant canonical-history reuse.
+ *
+ * The qwen4 model is hybrid: SSM/linear-attention recurrent state cannot be
+ * truncated to an arbitrary prefix, so partial reuse is infeasible.  We can
+ * only reuse the full frontier (live_pos) when the shared history is the SAME
+ * conversation the client intends.
+ *
+ * The client echoes assistant reasoning/content verbatim, but the server
+ * re-renders it through think-tag templates and BPE re-tokenization is not
+ * invertible, so every assistant turn's re-tokenized tokens drift from the
+ * sampled checkpoint tokens (common lands at the first assistant turn, not
+ * the last).  Per the operator, assistant-side text is out of scope (the
+ * client owns it), so the server must NOT whitespace-normalize to accommodate
+ * it.  Instead verification is TEXT-level and masks the two regions that are
+ * allowed to differ - assistant-turn text and image rendering (marker text
+ * vs decoded vision tokens, already authenticated by the fingerprint gate):
+ *
+ *   canon_mask_checkpoint decodes the checkpoint's own tokens and replaces
+ *     every assistant turn and image span with a placeholder;
+ *   canon_mask_text   replaces every assistant turn and image marker in the
+ *     re-rendered shared history with the same placeholder;
+ *
+ * the remaining user/system text and message template must then match
+ * EXACTLY (memcmp, no whitespace stripping).  The assistant turns are reused
+ * from the checkpoint's own sampled tokens, so agent-side space insertion
+ * never enters the prompt.
+ *
+ * On match we reuse the checkpoint's OWN tokens [0, live_pos) and re-tokenize
+ * only the new user-message suffix, so no shared history is re-tokenized at
+ * all (drift eliminated).  Fails open on any doubt (a user/system/image edit
+ * or an unrecognized drift -> cold prefill).
+ * --------------------------------------------------------------------- */
+#define CANON_USER_DELIM "<|im_start|>user\n"
+#define CANON_IMG_PH "\x01IMG\x02"
+#define CANON_ASST_PH "\x03ASST\x04"
+#define CANON_MAXIV 160
+
+/* Byte offset of the LAST user-message delimiter in ptext, or -1.  The shared
+ * history is everything before it; the new user message + generation prompt is
+ * the suffix. */
+static long canon_last_user_delim(const char *ptext, size_t plen) {
+    const char *needle = CANON_USER_DELIM;
+    const char *last = NULL;
+    const char *p = ptext;
+    for (;;) {
+        const char *f = strstr(p, needle);
+        if (!f) break;
+        last = f;
+        p = f + 1;
+    }
+    if (!last) return -1;
+    if ((size_t)(last - ptext) > plen) return -1;
+    return (long)(last - ptext);
+}
+
+/* Is the suffix [off,plen) exactly "new user message + open generation prompt"?
+ * The qwen generation prompt itself is <|im_start|>assistant\n thinking\n
+ * (no <|im_end|>), so a continuation whose last message is the new user turn
+ * has exactly one <|im_start|>assistant in the suffix and it is NOT closed.
+ * A closed assistant/tool message would carry a matching <|im_end|> after it
+ * and must reject. */
+static bool canon_suffix_is_generation(const char *ptext, size_t plen, size_t off) {
+    const char *needle = "<|im_start|>assistant";
+    if (off >= plen) return false;
+    const char *gen = strstr(ptext + off, needle);
+    if (!gen) return false;   /* no generation prompt -> not a continuation */
+    /* the generation prompt is open: no <|im_end|> may follow its assistant
+     * start (a closed assistant message would close it) */
+    return strstr(gen + strlen(needle), "<|im_end|>") == NULL;
+}
+
+/* Decode the checkpoint's own tokens, replacing every assistant turn and image
+ * span with a placeholder.  The remaining user/system text + message template
+ * is copied VERBATIM (no whitespace normalization).  Assistant turns run from
+ * each <|im_start|>assistant to the next <|im_start|> (any role) or the end of
+ * the buffer; image spans are masked by token index. */
+static void canon_mask_checkpoint(ds4_engine *engine, const ds4_tokens *tokens,
+                                  const ds4_vision_span *spans, size_t nspans,
+                                  buf *b) {
+    if (!engine || !tokens || !b) return;
+    const int n = tokens->len;
+    long *offs = xmalloc((size_t)n * sizeof(long));
+    size_t *lens = xmalloc((size_t)n * sizeof(size_t));
+    buf raw = {0};
+    for (int i = 0; i < n; i++) {
+        size_t len = 0;
+        char *piece = ds4_token_text(engine, tokens->v[i], &len);
+        offs[i] = (long)raw.len;
+        lens[i] = len;
+        buf_append(&raw, piece, len);
+        free(piece);
+    }
+    long ib[CANON_MAXIV], ie[CANON_MAXIV];
+    char iph[CANON_MAXIV];
+    int cnt = 0;
+    /* image spans -> byte ranges */
+    for (size_t s = 0; s < nspans && cnt < CANON_MAXIV; s++) {
+        const uint32_t st = spans[s].token_start;
+        uint64_t tc = spans[s].embedding.token_count;
+        if ((uint64_t)st >= (uint64_t)n || tc == 0) continue;
+        if ((uint64_t)st + tc > (uint64_t)n) tc = (uint64_t)n - st;
+        long bgn = offs[st];
+        long end = offs[(long)st + (long)tc - 1] +
+                        (long)lens[(long)st + (long)tc - 1];
+        /* Include the <|vision_start|> / <|vision_end|> wrapper tokens so the
+         * masked region is exactly one <IMG> placeholder, matching the marker
+         * side in canon_mask_text.  Only extend when the neighboring tokens
+         * really are the vision wrappers (deepseek4 layouts have no wrapper). */
+        if ((uint64_t)st >= 1 && (uint64_t)st + tc < (uint64_t)n) {
+            /* ds4_token_text null-terminates; compare by content, not length */
+            char *wp = ds4_token_text(engine, tokens->v[(long)st - 1], NULL);
+            if (wp && strcmp(wp, "<|vision_start|>") == 0)
+                bgn = offs[(long)st - 1];
+            free(wp);
+            wp = ds4_token_text(engine, tokens->v[(long)st + (long)tc], NULL);
+            if (wp && strcmp(wp, "<|vision_end|>") == 0)
+                end = offs[(long)st + (long)tc] + (long)lens[(long)st + (long)tc];
+            free(wp);
+        }
+        if (end <= bgn) continue;
+        ib[cnt] = bgn; ie[cnt] = end; iph[cnt] = 'I'; cnt++;
+    }
+    /* assistant turns -> byte ranges */
+    const char *assist = "<|im_start|>assistant";
+    const char *mark = "<|im_start|>";
+    for (const char *p = raw.ptr; p; ) {
+        const char *f = strstr(p, assist);
+        if (!f) break;
+        const long bgn = (long)(f - raw.ptr);
+        const char *nx = strstr(f + strlen(assist), mark);
+        const long end = nx ? (long)(nx - raw.ptr) : (long)raw.len;
+        if (end > bgn && cnt < CANON_MAXIV) {
+            ib[cnt] = bgn; ie[cnt] = end; iph[cnt] = 'A'; cnt++;
+        }
+        p = f + strlen(assist);
+    }
+    /* walk raw, copy unmasked verbatim, emit placeholders for masked */
+    long pos = 0;
+    while (pos < (long)raw.len) {
+        long nxt = (long)raw.len;
+        int hit = -1;
+        for (int k = 0; k < cnt; k++) {
+            if (ib[k] <= pos && pos < ie[k]) { hit = k; break; }
+            if (ib[k] > pos && ib[k] < nxt) nxt = ib[k];
+        }
+        if (hit >= 0) {
+            buf_puts(b, iph[hit] == 'I' ? CANON_IMG_PH : CANON_ASST_PH);
+            pos = ie[hit];
+        } else {
+            buf_append(b, raw.ptr + pos, (size_t)(nxt - pos));
+            pos = nxt;
+        }
+    }
+    buf_free(&raw);
+    free(offs);
+    free(lens);
+}
+
+/* Mask assistant turns + image markers in the re-rendered shared history
+ * [0,len) (the suffix is NOT included).  User/system text + template copied
+ * verbatim. */
+static void canon_mask_text(buf *b, const char *text, size_t len,
+                            const char (*markers)[SERVER_IMAGE_MARKER_BYTES],
+                            size_t count) {
+    if (!b || !text) return;
+    long ib[CANON_MAXIV], ie[CANON_MAXIV];
+    char iph[CANON_MAXIV];
+    int cnt = 0;
+    const char *end = text + len;
+    const char *assist = "<|im_start|>assistant";
+    const char *mark = "<|im_start|>";
+    for (const char *p = text; p && p < end; ) {
+        const char *f = strstr(p, assist);
+        if (!f || f >= end) break;
+        const long bgn = (long)(f - text);
+        const char *nx = strstr(f + strlen(assist), mark);
+        const long e = (nx && nx < end) ? (long)(nx - text) : (long)(end - text);
+        if (e > bgn && cnt < CANON_MAXIV) {
+            ib[cnt] = bgn; ie[cnt] = e; iph[cnt] = 'A'; cnt++;
+        }
+        p = f + strlen(assist);
+    }
+    /* image markers */
+    for (const char *p = text; p && p < end; ) {
+        bool found = false;
+        for (size_t k = 0; k < count && !found; k++) {
+            const char *mk = markers[k];
+            const size_t mlen = strlen(mk);
+            if (mlen && mlen <= (size_t)(end - p) && memcmp(p, mk, mlen) == 0) {
+                if (cnt < CANON_MAXIV) {
+                    ib[cnt] = (long)(p - text);
+                    ie[cnt] = ib[cnt] + (long)mlen;
+                    iph[cnt] = 'I';
+                    cnt++;
+                }
+                p += mlen;
+                found = true;
+            }
+        }
+        if (!found) p++;
+    }
+    long pos = 0;
+    while (pos < (long)len) {
+        long nxt = (long)len;
+        int hit = -1;
+        for (int k = 0; k < cnt; k++) {
+            if (ib[k] <= pos && pos < ie[k]) { hit = k; break; }
+            if (ib[k] > pos && ib[k] < nxt) nxt = ib[k];
+        }
+        if (hit >= 0) {
+            buf_puts(b, iph[hit] == 'I' ? CANON_IMG_PH : CANON_ASST_PH);
+            pos = ie[hit];
+        } else {
+            buf_append(b, text + pos, (size_t)(nxt - pos));
+            pos = nxt;
+        }
+    }
+}
 
 static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
                                           const request *req) {
@@ -11721,6 +11942,44 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         pr.reuse_tokens = live_pos;
         pr.suffix_off = slot->live_text_len;
         return pr;
+    }
+
+    /* Canonical-history tier: every strict tier missed because the re-rendered
+     * shared history drifts from the sampled checkpoint tokens.  Verify the
+     * request is the SAME conversation in a drift-tolerant space (assistant
+     * turns and image regions masked to placeholders), then reuse the
+     * checkpoint's OWN full frontier and re-tokenize only the new user
+     * message.  Always on.  Fails open on any doubt.
+     *
+     * Runs only on the drift-miss path (common < live_pos).  Images are
+     * already authenticated by the fingerprint gate above (positions are
+     * rebased at materialization).  Verification masks assistant turns and
+     * image regions on both sides and requires the user/system text + message
+     * template to match EXACTLY. */
+    if (ptext && req->kind == REQ_CHAT && common < live_pos)
+    {
+        const long soff = canon_last_user_delim(ptext, plen);
+        if (soff > 0 && (size_t)soff < plen &&
+            canon_suffix_is_generation(ptext, plen, (size_t)soff))
+        {
+            buf mc = {0}, mt = {0};
+            ds4_vision_span cspans[16];
+            const size_t ncs =
+                ds4_session_checkpoint_vision_spans(slot->session, cspans, 16);
+            canon_mask_checkpoint(s->engine, live, cspans, ncs, &mc);
+            canon_mask_text(&mt, ptext, (size_t)soff, req->image_markers,
+                            req->image_count);
+            if (mc.len == mt.len && memcmp(mc.ptr, mt.ptr, mc.len) == 0) {
+                pr.kind = REUSE_MEMORY_CANON;
+                pr.reuse_tokens = live_pos;
+                pr.suffix_off = (size_t)soff;
+                buf_free(&mc);
+                buf_free(&mt);
+                return pr;
+            }
+            buf_free(&mc);
+            buf_free(&mt);
+        }
     }
 
     return pr;
@@ -13566,6 +13825,21 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
         live_materialized = true;
         cache_source = "memory-text";
+        prompt_for_sync = &effective_prompt;
+        break;
+    case REUSE_MEMORY_CANON:
+        /* Reuse the checkpoint's own full frontier and re-tokenize only the
+         * new user message.  build_live_prompt_suffix re-validates the vision
+         * prefix and rebases image positions; any failure is a safe cold
+         * prefill (fail-open). */
+        if (!build_live_prompt_suffix(s, slot, &j->req,
+            j->req.prompt_text + reuse.suffix_off, &effective_prompt)) {
+            cached = 0;
+            cache_source = "none";
+            break;
+        }
+        live_materialized = true;
+        cache_source = "memory-canon";
         prompt_for_sync = &effective_prompt;
         break;
     case REUSE_NONE:
@@ -16285,6 +16559,60 @@ static void test_slot_probe_and_routing_scores(void) {
     ds4_tokens_free(&sub.req.prompt);
     ds4_tokens_free(&ext.req.prompt);
     ds4_tokens_free(&txt.req.prompt);
+}
+
+/* Canonical-history helpers: pure text normalization / suffix detection
+ * (no engine needed).  Verifies the drift-tolerant "same conversation"
+ * machinery that lets a drifted re-render reuse the checkpoint frontier
+ * instead of cold prefilling. */
+static void test_canon_reuse_helpers(void) {
+    /* canon_last_user_delim: last user-message delimiter. */
+    const char *ptext =
+        "<|im_start|>system\nS<|im_end|>\n"
+        "<|im_start|>user\nU1<|im_end|>\n"
+        "<|im_start|>assistant\nA1<|im_end|>\n"
+        "<|im_start|>user\nU2<|im_end|>\n"
+        "\n<|im_start|>assistant\n thinking\n";
+    size_t plen = strlen(ptext);
+    const char *u2 = strstr(ptext, "<|im_start|>user\nU2");
+    TEST_ASSERT(u2 && canon_last_user_delim(ptext, plen) == (long)(u2 - ptext));
+    /* no user message at all */
+    TEST_ASSERT(canon_last_user_delim("<|im_start|>assistant\nx", 0) == -1);
+
+    /* canon_suffix_is_generation: a normal continuation ends with the OPEN qwen
+     * generation prompt <|im_start|>assistant\n thinking\n (no <|im_end|>); a
+     * closed assistant/tool message carries a matching <|im_end|> and must
+     * reject. */
+    TEST_ASSERT(canon_suffix_is_generation(ptext, plen, (size_t)(u2 - ptext)));
+    /* closed assistant message after the last user -> reject */
+    const char *ptext2 =
+        "<|im_start|>user\nU1<|im_end|>\n"
+        "<|im_start|>assistant\nA1<|im_end|>\n";
+    size_t p2len = strlen(ptext2);
+    TEST_ASSERT(canon_last_user_delim(ptext2, p2len) == 0);
+    TEST_ASSERT(!canon_suffix_is_generation(ptext2, p2len, 0));
+
+    /* canon_mask_text: assistant turns + image markers -> placeholders, all
+     * user/system text + template preserved VERBATIM (no whitespace-strip). */
+    {
+        char mk[2][SERVER_IMAGE_MARKER_BYTES] =
+            {"\x1eIMG_A\x1f", "\x1eIMG_B\x1f"};
+        const char *txt =
+            "<|im_start|>user\nU1 \x1eIMG_A\x1f <|im_end|>\n"
+            "<|im_start|>assistant\n thinking\nR1\n response\n\nC1<|im_end|>\n"
+            "<|im_start|>user\nU2\x1eIMG_B\x1f<|im_end|>\n";
+        buf mm = {0};
+        canon_mask_text(&mm, txt, strlen(txt), mk, 2);
+        /* assistant region (incl. its <|im_end|> and trailing newline) is
+         * masked; markers masked; the two user messages + template survive
+         * byte-for-byte, whitespace intact. */
+        const char *want =
+            "<|im_start|>user\nU1 " CANON_IMG_PH " <|im_end|>\n"
+            CANON_ASST_PH
+            "<|im_start|>user\nU2" CANON_IMG_PH "<|im_end|>\n";
+        TEST_ASSERT(strcmp(mm.ptr ? mm.ptr : "", want) == 0);
+        buf_free(&mm);
+    }
 }
 
 /* Staleness tiers: a resident checkpoint idle past SLOT_STALE_AFTER_SEC is
@@ -22943,6 +23271,7 @@ static void ds4_server_unit_tests_run(void) {
     test_batched_live_continuation_slot_binding();
     test_live_continuation_contract();
     test_slot_probe_and_routing_scores();
+    test_canon_reuse_helpers();
     test_slot_probe_live_state_tiers();
     test_slot_probe_vision_tiers();
     test_slot_routing_staleness_tiers();
